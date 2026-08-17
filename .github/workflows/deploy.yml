@@ -1,0 +1,63 @@
+name: Deploy Streamlit HITL Dashboard to Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'streamlit_dashboard/**'
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: us-central1
+  ARTIFACT_REGISTRY_REPO: idp-tax-processing-repo
+  IMAGE_NAME: hitl-dashboard
+  CLOUD_RUN_SERVICE: tax-hitl-dashboard
+
+jobs:
+  build-and-deploy:
+    name: Build Container & Deploy to Cloud Run
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Source Code Repository
+      uses: actions/checkout@v4
+
+    - name: Authenticate with Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set Up Cloud SDK Engine
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Configure Docker Authentication for Artifact Registry
+      run: |
+        gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+
+    - name: Build and Push Docker Container Image
+      run: |
+        IMAGE_URI="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+
+        docker build \
+          -t $IMAGE_URI \
+          -f streamlit_dashboard/Dockerfile \
+          streamlit_dashboard/
+
+        docker push $IMAGE_URI
+        echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+    - name: Deploy Streamlit Image to Google Cloud Run
+      uses: google-github-actions/deploy-cloudrun@v2
+      with:
+        service: ${{ env.CLOUD_RUN_SERVICE }}
+        region: ${{ env.GCP_REGION }}
+        image: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        flags: |
+          --allow-unauthenticated
+          --port=8501
+          --set-env-vars=HITL_BUCKET_NAME=your-hitl-review-queue,VERIFIED_BUCKET_NAME=your-verified-tax-data
+
+    - name: Print Production Execution Status Endpoint
+      run: |
+        echo "🚀 Production App Live Deployment Target Executed Successfully!"
