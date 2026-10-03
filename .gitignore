@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+cloud_functions/ingestion/tax_record.py
+local_testing/hitl_queue/
+local_testing/verified_data/
