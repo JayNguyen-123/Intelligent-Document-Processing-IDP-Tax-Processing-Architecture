@@ -1,0 +1,6 @@
+# Pin exact versions (and ideally hashes via pip-compile --generate-hashes) for reproducible deploys.
+functions-framework>=3.8,<4
+google-cloud-documentai>=3.0,<4
+google-cloud-storage>=2.18,<4
+google-cloud-pubsub>=2.23,<3
+google-cloud-bigquery>=3.25,<4
