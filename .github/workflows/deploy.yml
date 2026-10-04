@@ -1,1 +1,118 @@
+name: Test & Deploy IDP Tax Pipeline
 
+# Test on every PR/push; deploy only from main after tests pass.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never run two deploys of the same ref at once.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+# Keyless auth (Workload Identity Federation) needs id-token: write.
+permissions:
+  contents: read
+  id-token: write
+
+# Non-secret config lives in repo "Variables" (Settings > Secrets and variables > Actions > Variables).
+env:
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION || 'us-central1' }}
+  AR_REPO: idp-tax-processing-repo
+  IMAGE_NAME: hitl-dashboard
+  CLOUD_RUN_SERVICE: tax-hitl-dashboard
+  RAW_BUCKET: ${{ vars.GCP_PROJECT_ID }}-raw-tax-inputs
+  HITL_BUCKET: ${{ vars.GCP_PROJECT_ID }}-hitl-review-queue
+  VERIFIED_BUCKET: ${{ vars.GCP_PROJECT_ID }}-verified-tax-data
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Lint
+        run: |
+          pip install -r requirements-dev.txt
+          ruff check --select E,F,W,B --ignore E501 .
+      - name: Unit tests
+        run: python -m pytest -q tests
+      - name: Routing simulation (smoke test)
+        run: python local_testing/simulate_pipeline.py
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: production   # add required reviewers on this environment for gated releases
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation - no JSON keys)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Sync shared module into function sources
+        run: ./scripts/sync_shared.sh
+
+      - name: Deploy ingestion function (gen2, GCS trigger, retries on)
+        run: |
+          gcloud functions deploy process-tax-upload \
+            --gen2 --region="$GCP_REGION" --runtime=python312 \
+            --source=cloud_functions/ingestion --entry-point=process_tax_upload \
+            --trigger-bucket="$RAW_BUCKET" --retry \
+            --service-account="${{ vars.INGESTION_SA }}" \
+            --memory=1Gi --timeout=300s --max-instances=20 --concurrency=1 \
+            --set-env-vars="GCP_PROJECT_ID=$GCP_PROJECT_ID,DOCAI_LOCATION=${{ vars.DOCAI_LOCATION || 'us' }},DOCAI_PROCESSOR_ID=${{ vars.DOCAI_PROCESSOR_ID }},DOCAI_PROCESSOR_VERSION=${{ vars.DOCAI_PROCESSOR_VERSION }},HITL_BUCKET_NAME=$HITL_BUCKET,VERIFIED_BUCKET_NAME=$VERIFIED_BUCKET,PUBSUB_TOPIC_NAME=hitl-alerts,CONFIDENCE_THRESHOLD=${{ vars.CONFIDENCE_THRESHOLD || '0.85' }}"
+
+      - name: Deploy alert function (gen2, Pub/Sub trigger, secrets from Secret Manager)
+        run: |
+          gcloud functions deploy handle-hitl-alert \
+            --gen2 --region="$GCP_REGION" --runtime=python312 \
+            --source=cloud_functions/alerts --entry-point=handle_hitl_alert \
+            --trigger-topic=hitl-alerts --retry \
+            --service-account="${{ vars.ALERTS_SA }}" \
+            --memory=256Mi --timeout=60s --max-instances=5 \
+            --set-env-vars="FROM_EMAIL=${{ vars.ALERT_FROM_EMAIL }},TO_EMAIL=${{ vars.ALERT_TO_EMAIL }},DASHBOARD_URL=${{ vars.DASHBOARD_URL }}" \
+            --set-secrets="SLACK_WEBHOOK_URL=slack-webhook-url:latest,SENDGRID_API_KEY=sendgrid-api-key:latest"
+
+      - name: Build & push dashboard image
+        run: |
+          IMAGE_URI="$GCP_REGION-docker.pkg.dev/$GCP_PROJECT_ID/$AR_REPO/$IMAGE_NAME:${{ github.sha }}"
+          gcloud auth configure-docker "$GCP_REGION-docker.pkg.dev" --quiet
+          docker build -f streamlit_dashboard/Dockerfile -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+      - name: Deploy dashboard to Cloud Run (private - fronted by IAP)
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.CLOUD_RUN_SERVICE }}
+          region: ${{ env.GCP_REGION }}
+          image: ${{ env.IMAGE_URI }}
+          flags: >-
+            --no-allow-unauthenticated
+            --service-account=${{ vars.DASHBOARD_SA }}
+            --session-affinity
+            --min-instances=0
+            --max-instances=3
+            --cpu=1 --memory=1Gi
+          env_vars: |
+            GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }}
+            HITL_BUCKET_NAME=${{ env.HITL_BUCKET }}
+            VERIFIED_BUCKET_NAME=${{ env.VERIFIED_BUCKET }}
+            IAP_AUDIENCE=${{ vars.IAP_AUDIENCE }}
+
+      - name: Smoke check
+        run: |
+          gcloud run services describe "$CLOUD_RUN_SERVICE" --region="$GCP_REGION" \
+            --format='value(status.conditions[0].status,status.url)'
